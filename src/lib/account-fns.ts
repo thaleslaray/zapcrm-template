@@ -1,0 +1,135 @@
+// Server functions da conta: encerrar e baixar os dados. Os registros de cada
+// módulo (foto, auditoria...) vêm de src/lib/account-handlers.ts, carregado
+// pelo src/server.ts.
+import { env, waitUntil } from 'cloudflare:workers'
+import { createServerFn } from '@tanstack/react-start'
+import { getRequest } from '@tanstack/react-start/server'
+import { eq } from 'drizzle-orm'
+import { user } from '#/db/auth-schema'
+import { getDb } from '#/db/index'
+import {
+  ACCOUNT_RETENTION_DAYS,
+  assertFreshSession,
+  closeOutcome,
+  collectAccountExport,
+  runAccountDeletionGuards,
+} from '#/lib/account'
+import { audit, requestMeta } from '#/lib/audit'
+import { getAuth } from '#/lib/auth'
+import { sendEmailSafely } from '#/lib/email'
+import { accountClosedEmail } from '#/lib/email-templates'
+import { limitarUsuario } from '#/lib/rate-limit'
+import { enforceAccess } from '#/lib/session-access'
+import { conferirUltimoGestor, garantirSubstituto } from '#/lib/ultimo-gestor'
+import { exigirLogin } from './exigir-login'
+
+async function requireSession() {
+  const request = getRequest()
+  const headers = request.headers
+  // `disableCookieCache`: ação sensível, confere no banco (o cache da sessão em
+  // cookie pode estar até 60 s atrasado, ex.: sessão já revogada).
+  const current = await enforceAccess(
+    env,
+    await getAuth(env, request).api.getSession({
+      headers,
+      query: { disableCookieCache: true },
+    }),
+  )
+  if (!current) exigirLogin()
+  await limitarUsuario(current.user.id, 'escrita')
+  return { current, headers }
+}
+
+/**
+ * Fase 1 do encerramento (src/lib/account.ts): marca `deletedAt`, derruba
+ * todas as sessões e avisa por e-mail. Nada é apagado agora: o cron apaga
+ * depois de ACCOUNT_RETENTION_DAYS dias.
+ */
+export const closeAccountFn = createServerFn({ method: 'POST' }).handler(
+  async () => {
+    const { current, headers } = await requireSession()
+    // Quem não confirmou o e-mail pode ter criado a conta no nome de outra pessoa.
+    if (!current.user.emailVerified) {
+      throw new Error('Confirme seu e-mail antes de encerrar a conta.')
+    }
+    // "freshAge" feito à mão: o do Better Auth só vale para os endpoints dele
+    // (senha, e-mail), e aqui o login é por código. Sessão com mais de 1 hora
+    // (cookie esquecido ou roubado) não encerra a conta.
+    assertFreshSession(current.session.createdAt, 'encerrar a conta')
+    const me = { id: current.user.id, email: current.user.email }
+    // Um guard pode recusar (ex.: assinatura ativa); a mensagem chega à tela.
+    await runAccountDeletionGuards(me)
+
+    const db = getDb(env.DB)
+    const now = new Date()
+    // Atômico: marca a conta e derruba as sessões juntos. O resultado do batch
+    // traz `meta.changes` por instrução: 0 no primeiro = a conta já estava
+    // encerrada (dois pedidos ao mesmo tempo, ex.: duplo clique).
+    const banco = db.$client
+    const [, marked] = await banco
+      .batch([
+        await garantirSubstituto(db, me.id),
+        banco
+          .prepare(
+            'UPDATE user SET deleted_at=?1,purge_reminded_at=NULL,updated_at=?1 WHERE id=?2 AND deleted_at IS NULL',
+          )
+          .bind(now.getTime(), me.id),
+        banco.prepare('DELETE FROM session WHERE user_id=?').bind(me.id),
+      ])
+      .catch(conferirUltimoGestor)
+    let storedDeletedAt: Date | null = null
+    if (marked.meta.changes === 0) {
+      const [row] = await db
+        .select({ deletedAt: user.deletedAt })
+        .from(user)
+        .where(eq(user.id, me.id))
+        .limit(1)
+      storedDeletedAt = row?.deletedAt ?? null
+    }
+    const { first, purgeAt } = closeOutcome(
+      marked.meta.changes,
+      storedDeletedAt,
+      now,
+    )
+    // O outro pedido já auditou e avisou por e-mail: não repete.
+    if (!first) return { purgeAt: purgeAt.toISOString() }
+    await audit(
+      {
+        action: 'account.close_requested',
+        actorId: me.id,
+        actorEmail: me.email,
+        targetType: 'user',
+        targetId: me.id,
+        meta: { purgeAt: purgeAt.toISOString(), days: ACCOUNT_RETENTION_DAYS },
+        ...requestMeta(headers),
+      },
+      { waitUntil },
+    )
+    // Falha de envio não desfaz o encerramento (sendEmailSafely só registra).
+    await sendEmailSafely({ to: me.email, ...accountClosedEmail({ purgeAt }) })
+    return { purgeAt: purgeAt.toISOString() }
+  },
+)
+
+/** "Baixar meus dados": um JSON com a fatia de cada módulo (onAccountExport). */
+export const exportMyDataFn = createServerFn({ method: 'POST' }).handler(
+  async () => {
+    const { current, headers } = await requireSession()
+    // Os dados da conta inteira: mesma regra de sessão recente do encerramento.
+    assertFreshSession(current.session.createdAt, 'baixar seus dados')
+    const me = { id: current.user.id, email: current.user.email }
+    const data = await collectAccountExport(me)
+    await audit(
+      {
+        action: 'account.data_exported',
+        actorId: me.id,
+        actorEmail: me.email,
+        targetType: 'user',
+        targetId: me.id,
+        ...requestMeta(headers),
+      },
+      { waitUntil },
+    )
+    return { exportedAt: new Date().toISOString(), ...data }
+  },
+)

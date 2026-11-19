@@ -1,0 +1,27 @@
+node_modules
+.DS_Store
+dist
+*.local
+.env
+.tanstack
+.wrangler
+.dev.vars
+test-results
+playwright-report
+e2e/.dev.log
+# Sessão do Playwright (storageState) gravada pelos testes
+e2e/.auth/
+.prod.vars
+.claude/settings.local.json
+# Saída do cf/v2 beta (branch cf-v2-beta); não é mais gerada em main
+.cloudflare/
+
+# Teste de carga (k6): sessões e resultados
+load/.sessoes.json
+load/resultado*.json
+
+# Pesquisa de documentação (firecrawl)
+.firecrawl/
+
+# Evidência visual local do ZapCRM
+.scratch/zapcrm/capturas/

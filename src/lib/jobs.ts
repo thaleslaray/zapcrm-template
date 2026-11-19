@@ -1,0 +1,310 @@
+// Registro simples de jobs agendados. O cron (wrangler.jsonc) chama `runJobs` pelo
+// `scheduled()` do src/server.ts. Cada job roda isolado: um erro não impede os demais.
+import '@tanstack/react-start/server-only'
+import {
+  and,
+  asc,
+  eq,
+  exists,
+  gte,
+  isNotNull,
+  isNull,
+  lt,
+  ne,
+} from 'drizzle-orm'
+import { account, session, user, verification } from '#/db/auth-schema'
+import { getDb } from '#/db/index'
+import { auditLog, otpDiario } from '#/db/schema'
+import {
+  purgeCutoff,
+  purgeDateFor,
+  reminderCutoff,
+  runAccountDeletionGuards,
+  runBeforeAccountDelete,
+  unverifiedSocialCutoff,
+} from '#/lib/account'
+import { audit } from '#/lib/audit'
+import { limparArquivosExcluidos } from '#/lib/carteira-escrita-arquivos'
+import { sendEmailSafely } from '#/lib/email'
+import { accountPurgeReminderEmail } from '#/lib/email-templates'
+import { verificarWebhooks } from '#/lib/wa-webhook-saude'
+
+export interface Job {
+  name: string
+  /** Retorna um detalhe curto para o log, ex.: "sessions=2 verifications=0". */
+  // biome-ignore lint/suspicious/noConfusingVoidType: o job pode não devolver detalhe nenhum
+  run: (env: Env) => Promise<string | void>
+}
+
+const jobs: Job[] = []
+
+export function registerJob(job: Job): void {
+  jobs.push(job)
+}
+
+export async function runJobs(
+  env: Env,
+): Promise<Record<string, 'ok' | 'erro'>> {
+  const result: Record<string, 'ok' | 'erro'> = {}
+  for (const job of jobs) {
+    try {
+      const detail = await job.run(env)
+      console.log(`[jobs] ${job.name}: ${detail ?? 'ok'}`)
+      result[job.name] = 'ok'
+    } catch (error) {
+      console.error(`[jobs] ${job.name}: falhou`, error)
+      result[job.name] = 'erro'
+    }
+  }
+  return result
+}
+
+// Apaga sessões e códigos de verificação (OTP, links) já expirados.
+registerJob({
+  name: 'auth.limpar-expirados',
+  async run(env) {
+    const db = getDb(env.DB)
+    const now = new Date()
+    // D1 não tem transação aninhada: db.batch executa as duas exclusões de forma atômica.
+    const [sessions, verifications] = await db.batch([
+      db.delete(session).where(lt(session.expiresAt, now)),
+      db.delete(verification).where(lt(verification.expiresAt, now)),
+    ])
+    return `sessions=${sessions.meta.changes} verifications=${verifications.meta.changes}`
+  },
+})
+
+// Contador diário de pedidos de código (src/lib/otp-daily-cap.ts): só o dia de
+// hoje importa; guarda uma semana de linhas e apaga o resto.
+registerJob({
+  name: 'otp.limpar-contador',
+  async run(env) {
+    const cutoff = new Date(Date.now() - 7 * 86_400_000)
+      .toISOString()
+      .slice(0, 10)
+    const result = await getDb(env.DB)
+      .delete(otpDiario)
+      .where(lt(otpDiario.dia, cutoff))
+    return `apagadas=${result.meta.changes}`
+  },
+})
+
+// Retoma os arquivos de contatos apagados quando uma tentativa anterior caiu.
+registerJob({
+  name: 'contatos.expurgar-arquivos',
+  async run(env) {
+    await env.DB.prepare(
+      'DELETE FROM mensagens_excluidas WHERE excluida_em < ?',
+    )
+      .bind(Date.now() - 366 * 86400000)
+      .run()
+    const quantidade = await limparArquivosExcluidos(getDb(env.DB), env.BUCKET)
+    return `arquivos=${quantidade}`
+  },
+})
+
+// Quantas contas apagar por noite: cada uma passa pelas limpezas (R2...).
+// Um acúmulo se resolve em poucas noites, sem prender uma execução por minutos.
+const PURGE_BATCH = 25
+
+// Fase 2 do encerramento (src/lib/account.ts): passado o prazo, apaga de vez.
+// Guards de novo, limpezas fora do D1, a linha do usuário (sessões e contas
+// vinculadas vão em cascata) e o evento de auditoria. Idempotente: uma conta
+// que falha fica para a noite seguinte; uma já apagada não aparece mais.
+registerJob({
+  name: 'conta.apagar-encerradas',
+  async run(env) {
+    const db = getDb(env.DB)
+    const due = await db
+      .select({ id: user.id, email: user.email })
+      .from(user)
+      .where(
+        and(
+          isNotNull(user.deletedAt),
+          lt(user.deletedAt, purgeCutoff(new Date())),
+        ),
+      )
+      // As mais antigas primeiro: ninguém fica para sempre no fim da fila.
+      .orderBy(asc(user.deletedAt))
+      .limit(PURGE_BATCH)
+    let purged = 0
+    let kept = 0
+    for (const ref of due) {
+      try {
+        await runAccountDeletionGuards(ref)
+        await runBeforeAccountDelete(ref)
+        // Reconfere `deletedAt` no próprio delete: se o suporte restaurou a
+        // conta (`deleted_at = NULL`) depois da consulta acima, a linha não
+        // casa e nada é apagado.
+        const result = await db
+          .delete(user)
+          .where(
+            and(
+              eq(user.id, ref.id),
+              isNotNull(user.deletedAt),
+              lt(user.deletedAt, purgeCutoff(new Date())),
+            ),
+          )
+        if (result.meta.changes === 0) {
+          kept++
+          continue
+        }
+        // Sem e-mail: a conta sumiu e o registro não guarda dado pessoal.
+        await audit({
+          action: 'account.deleted',
+          targetType: 'user',
+          targetId: ref.id,
+        })
+        purged++
+      } catch (error) {
+        console.error(`[jobs] conta ${ref.id} mantida`, error)
+        kept++
+      }
+    }
+    return `apagadas=${purged} mantidas=${kept}`
+  },
+})
+
+// Usuário criado pelo login social (tem uma conta que não é "credential") cujo
+// e-mail nunca foi verificado e que passou de UNVERIFIED_SOCIAL_DAYS dias:
+// cadastro abandonado. Mesmo caminho da fase 2 (guards, limpezas, linha,
+// auditoria), sem lembrete: a pessoa nunca terminou de entrar. Idempotente.
+registerJob({
+  name: 'conta.apagar-social-nao-verificada',
+  async run(env) {
+    const db = getDb(env.DB)
+    const due = await db
+      .select({ id: user.id, email: user.email })
+      .from(user)
+      .where(
+        and(
+          eq(user.emailVerified, false),
+          isNull(user.deletedAt),
+          lt(user.createdAt, unverifiedSocialCutoff(new Date())),
+          exists(
+            db
+              .select({ one: account.id })
+              .from(account)
+              .where(
+                and(
+                  eq(account.userId, user.id),
+                  ne(account.providerId, 'credential'),
+                ),
+              ),
+          ),
+        ),
+      )
+      .orderBy(asc(user.createdAt))
+      .limit(PURGE_BATCH)
+    let purged = 0
+    let kept = 0
+    for (const ref of due) {
+      try {
+        await runAccountDeletionGuards(ref)
+        await runBeforeAccountDelete(ref)
+        // Reconfere `emailVerified` na hora de apagar: quem verificou no meio
+        // do caminho não perde a conta.
+        const result = await db
+          .delete(user)
+          .where(and(eq(user.id, ref.id), eq(user.emailVerified, false)))
+        if (result.meta.changes === 0) {
+          kept++
+          continue
+        }
+        await audit({
+          action: 'account.deleted',
+          targetType: 'user',
+          targetId: ref.id,
+          meta: { reason: 'social_nao_verificada' },
+        })
+        purged++
+      } catch (error) {
+        console.error(`[jobs] usuário social ${ref.id} mantido`, error)
+        kept++
+      }
+    }
+    return `apagadas=${purged} mantidas=${kept}`
+  },
+})
+
+// Quantos dias a trilha de auditoria fica guardada. Passou disso, a linha some:
+// guardar para sempre IP e navegador de quem entrou é dado pessoal sem prazo.
+export const AUDIT_RETENTION_DAYS = 180
+
+/** Data de corte: linhas de auditoria mais antigas que isto são apagadas. */
+export function auditCutoff(now: Date): Date {
+  return new Date(now.getTime() - AUDIT_RETENTION_DAYS * 86_400_000)
+}
+
+// Apaga a auditoria vencida. Idempotente: rodar duas vezes seguidas apaga zero
+// na segunda. Usa o índice `audit_log_created_idx`.
+registerJob({
+  name: 'auditoria.retencao',
+  async run(env) {
+    const db = getDb(env.DB)
+    const result = await db
+      .delete(auditLog)
+      .where(lt(auditLog.createdAt, auditCutoff(new Date())))
+    return `apagadas=${result.meta.changes}`
+  },
+})
+
+registerJob({
+  name: 'whatsapp.verificar-webhooks',
+  run: verificarWebhooks,
+})
+
+// Contas encerradas no dia do lembrete (dia 5 de 7) que ainda não foram
+// avisadas. Pega também quem o cron "pulou" numa noite, desde que ainda esteja
+// dentro do prazo. Cada envio é REIVINDICADO antes com um update condicional
+// em `purgeRemindedAt`: cron duplicado ou dois rodando juntos mandam 1 e-mail.
+// Roda por ÚLTIMO e com teto (REMINDER_BATCH): o plano gratuito limita as
+// operações por invocação, e o expurgo (prazo legal) vem antes dos lembretes
+// (cortesia). O que passar do teto fica para a noite seguinte, enquanto a
+// conta estiver dentro do prazo.
+// Quantos lembretes mandar por noite (cada um é um update + um e-mail).
+export const REMINDER_BATCH = 50
+
+registerJob({
+  name: 'conta.lembrar-exclusao',
+  async run(env) {
+    const db = getDb(env.DB)
+    const now = new Date()
+    const due = await db
+      .select({ id: user.id })
+      .from(user)
+      .where(
+        and(
+          lt(user.deletedAt, reminderCutoff(now)),
+          gte(user.deletedAt, purgeCutoff(now)),
+          isNull(user.purgeRemindedAt),
+        ),
+      )
+      // As mais antigas primeiro: são as que estão mais perto do expurgo.
+      .orderBy(asc(user.deletedAt))
+      .limit(REMINDER_BATCH)
+    let reminded = 0
+    for (const { id } of due) {
+      const [claimed] = await db
+        .update(user)
+        .set({ purgeRemindedAt: now })
+        .where(
+          and(
+            eq(user.id, id),
+            isNotNull(user.deletedAt),
+            isNull(user.purgeRemindedAt),
+          ),
+        )
+        .returning({ email: user.email, deletedAt: user.deletedAt })
+      if (!claimed?.deletedAt) continue
+      await sendEmailSafely({
+        to: claimed.email,
+        ...accountPurgeReminderEmail({
+          purgeAt: purgeDateFor(claimed.deletedAt),
+        }),
+      })
+      reminded++
+    }
+    return `lembradas=${reminded}`
+  },
+})

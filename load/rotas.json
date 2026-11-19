@@ -1,0 +1,7 @@
+{
+  "_ajuda": "A base do ZapCRM tem telas de consulta. Ative escrita quando existir cadastro de contatos persistido, antes de medir o produto.",
+  "publicasEstaticas": ["/termos", "/privacidade"],
+  "publicasSsr": ["/login"],
+  "logadas": ["/app/conversas", "/app/contatos"],
+  "escrita": null
+}

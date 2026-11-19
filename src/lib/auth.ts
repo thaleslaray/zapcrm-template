@@ -1,0 +1,339 @@
+import { waitUntil } from 'cloudflare:workers'
+import { betterAuth } from 'better-auth'
+import { drizzleAdapter } from 'better-auth/adapters/drizzle'
+import { APIError, createAuthMiddleware } from 'better-auth/api'
+import { getCookies } from 'better-auth/cookies'
+import { emailOTP } from 'better-auth/plugins/email-otp'
+import { tanstackStartCookies } from 'better-auth/tanstack-start'
+import { eq } from 'drizzle-orm'
+
+import { user as userTable } from '#/db/auth-schema'
+import { getDb } from '#/db/index'
+import { registrarEntrada } from '#/lib/acesso-crm'
+import { acessoPorEmail } from '#/lib/acesso-email'
+import { auditAfterHook, auditDatabaseHooks } from '#/lib/auth-audit-hook'
+import {
+  assertAuthSecret,
+  DISABLED_PATHS,
+  isLocalUrl,
+  otpHasher,
+  passwordEnabled,
+  present,
+  resolveBaseURL,
+  resolveTrustedOrigins,
+} from '#/lib/auth-config'
+import {
+  assertEmailConfigured,
+  deliverOtp,
+  OTP_EXPIRES_IN_SECONDS,
+  OTP_REQUEST_TYPES,
+  SEND_OTP_PATH,
+  simulateOtpWork,
+} from '#/lib/auth-otp'
+import { assertPasswordNotCommon } from '#/lib/password-policy'
+import { sanitizeProfileUpdate } from '#/lib/profile'
+import { enforceAccess } from '#/lib/session-access'
+
+export { passwordEnabled }
+
+// O login social só liga quando o par de variáveis está completo.
+export function googleEnabled(env: Env) {
+  return present(env.GOOGLE_CLIENT_ID) && present(env.GOOGLE_CLIENT_SECRET)
+}
+export function githubEnabled(env: Env) {
+  return present(env.GITHUB_CLIENT_ID) && present(env.GITHUB_CLIENT_SECRET)
+}
+
+const LOOKS_LIKE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+const SEVEN_DAYS = 60 * 60 * 24 * 7
+const ONE_DAY = 60 * 60 * 24
+
+// Factory por request: em Workers, env só existe durante a requisição.
+// Passe a `request` sempre que tiver uma: sem BETTER_AUTH_URL, a URL do app é
+// a origem dela (o Better Auth só deduz sozinho dentro do `handler`; em
+// `auth.api.getSession` ele não vê a requisição e ficaria sem URL).
+export function getAuth(env: Env, request?: Request) {
+  // Segredo vazio ou curto assina cookie fraco: melhor não subir.
+  assertAuthSecret(env.BETTER_AUTH_SECRET)
+  const baseURL = resolveBaseURL(env.BETTER_AUTH_URL, request)
+  const password = passwordEnabled(env)
+  // Modo lista (`appConfig.accessMode`, src/lib/allowlist.ts): falha fechada.
+  // No modo 'open' devolve sempre true.
+  const canEnter = (email: unknown) => acessoPorEmail(env, email)
+  const auditHooks = auditDatabaseHooks(async (userId) => {
+    const [row] = await getDb(env.DB)
+      .select({ email: userTable.email })
+      .from(userTable)
+      .where(eq(userTable.id, userId))
+      .limit(1)
+    return row?.email ?? null
+  })
+  return betterAuth({
+    database: drizzleAdapter(getDb(env.DB), { provider: 'sqlite' }),
+    secret: env.BETTER_AUTH_SECRET.trim(),
+    baseURL,
+    // Em produção, só a origem de BETTER_AUTH_URL é confiável (o deploy exige
+    // a variável). Sem ela, cada host que chegasse ao Worker (workers.dev,
+    // domínio próprio) viraria origem confiável. Em dev: sem mudança.
+    ...(resolveTrustedOrigins(env.BETTER_AUTH_URL)
+      ? { trustedOrigins: resolveTrustedOrigins(env.BETTER_AUTH_URL) }
+      : {}),
+    // Rotas que o template não usa ficam em 404 (lista em auth-config.ts).
+    disabledPaths: DISABLED_PATHS,
+    // O limitador interno do Better Auth fica DESLIGADO de propósito. O modo
+    // "database" exigiria a tabela `rateLimit` (migração) e o modo em memória
+    // não vale em Workers (cada isolate tem a sua). O limite é feito antes, no
+    // handler de src/routes/api/auth/$.ts (src/lib/auth-rate-limit.ts), por IP
+    // (prefixo /64 no IPv6) e por e-mail, com o binding PUBLIC_RATE_LIMIT.
+    rateLimit: { enabled: false },
+    emailAndPassword: {
+      // Senha é opcional (PASSWORD_LOGIN_ENABLED). Quando liga, o e-mail precisa
+      // ser confirmado por código antes de existir sessão: sem isso, alguém
+      // poderia criar conta com o e-mail de outra pessoa.
+      enabled: password,
+      requireEmailVerification: true,
+      revokeSessionsOnPasswordReset: true,
+    },
+    // A verificação de e-mail é por código (plugin emailOTP com
+    // `overrideDefaultEmailVerification`): cadastro -> código -> verificado -> sessão.
+    emailVerification: {
+      sendOnSignUp: true,
+      sendOnSignIn: true,
+      autoSignInAfterVerification: true,
+    },
+    session: {
+      expiresIn: SEVEN_DAYS,
+      updateAge: ONE_DAY,
+      // Sessão "recente" = menos de 1 hora (usada em encerrar conta).
+      freshAge: 60 * 60,
+      // Cache da sessão num cookie assinado (`better-auth.session_data`): o
+      // getSession deixa de ir ao D1 (e ao primário, do outro lado do
+      // continente) a cada página. Custo: revogar uma sessão ou encerrar a conta
+      // só vale nos OUTROS aparelhos depois de até 60 s. Por isso as ações
+      // sensíveis (encerrar conta, baixar dados, trocar a foto) pedem
+      // `disableCookieCache` e leem o banco; e login novo continua barrado
+      // pelo guard ACCOUNT_CLOSED abaixo. Sem `refreshCache`: ele é para quem
+      // não tem banco.
+      cookieCache: { enabled: true, maxAge: 60, strategy: 'compact' },
+    },
+    user: {
+      // `input: false`: o navegador não consegue mexer nestes campos pelo
+      // /update-user. Quem escreve é src/lib/account-fns.ts e o cron.
+      additionalFields: {
+        deletedAt: { type: 'date', required: false, input: false },
+        purgeRemindedAt: { type: 'date', required: false, input: false },
+      },
+      // O `deleteUser` do Better Auth apaga NA HORA. Aqui encerrar é em duas
+      // fases (src/lib/account.ts), então o endpoint nativo fica desligado:
+      // ligado, qualquer cliente pularia o prazo de 7 dias.
+      deleteUser: { enabled: false },
+    },
+    account: {
+      // Tokens do Google/GitHub (access, refresh, id) ficam CIFRADOS no D1
+      // (AES com o BETTER_AUTH_SECRET): um vazamento do banco sozinho não
+      // entrega acesso à conta da pessoa no provedor. Custo: trocar o
+      // BETTER_AUTH_SECRET torna os tokens já guardados ilegíveis (o login
+      // social segue funcionando, pois o template não usa o token depois).
+      encryptOAuthTokens: true,
+    },
+    socialProviders: {
+      ...(googleEnabled(env)
+        ? {
+            google: {
+              // biome-ignore lint/style/noNonNullAssertion: googleEnabled/githubEnabled já garantem que a variável existe
+              clientId: env.GOOGLE_CLIENT_ID!,
+              // biome-ignore lint/style/noNonNullAssertion: googleEnabled/githubEnabled já garantem que a variável existe
+              clientSecret: env.GOOGLE_CLIENT_SECRET!,
+              // Só aceita contas cujo e-mail o provedor diz estar verificado.
+              requireEmailVerification: true,
+            },
+          }
+        : {}),
+      ...(githubEnabled(env)
+        ? {
+            github: {
+              // biome-ignore lint/style/noNonNullAssertion: googleEnabled/githubEnabled já garantem que a variável existe
+              clientId: env.GITHUB_CLIENT_ID!,
+              // biome-ignore lint/style/noNonNullAssertion: googleEnabled/githubEnabled já garantem que a variável existe
+              clientSecret: env.GITHUB_CLIENT_SECRET!,
+              // Só aceita contas cujo e-mail o provedor diz estar verificado.
+              requireEmailVerification: true,
+            },
+          }
+        : {}),
+    },
+    // Auditoria de login e troca de nome (src/lib/auth-audit-hook.ts).
+    hooks: {
+      // Senha da lista das mais comuns é recusada (só com senha ligada).
+      before: createAuthMiddleware(async (ctx) => {
+        assertEmailConfigured(ctx.path, password)
+        // Depois de recusar o envio sem provedor (vale para todos): no modo
+        // lista, e-mail fora dela pede código e responde IGUAL ao caminho de
+        // sucesso (200, `{ success: true }`), sem gerar nem enviar código.
+        if (ctx.path === SEND_OTP_PATH) {
+          const body = ctx.body as
+            | { email?: unknown; type?: unknown }
+            | undefined
+          const email = body?.email
+          const type = body?.type
+          // Formato inválido (inclui espaços) segue para o Better Auth e dá 400
+          // para todos: responder 200 só para quem está fora da lista deixaria
+          // alguém sondar a lista com e-mails com espaço.
+          if (
+            typeof email === 'string' &&
+            LOOKS_LIKE_EMAIL.test(email) &&
+            typeof type === 'string' &&
+            OTP_REQUEST_TYPES.has(type) &&
+            !(await canEnter(email))
+          ) {
+            // Mesmo trabalho de banco e de hash do caminho liberado, para o
+            // tempo de resposta não revelar quem está na lista.
+            await simulateOtpWork(
+              getDb(env.DB),
+              otpHasher(env.BETTER_AUTH_SECRET),
+              email,
+              type,
+            )
+            return ctx.json({ success: true })
+          }
+        }
+        assertPasswordNotCommon(ctx.path, ctx.body, password)
+      }),
+      after: auditAfterHook,
+    },
+    databaseHooks: {
+      // `audit*`: saída, vínculo de conta social e usuário novo vão para a
+      // auditoria (src/lib/auth-audit-hook.ts).
+      account: auditHooks.account,
+      // Conta encerrada não entra de novo durante o prazo, por nenhum método:
+      // todo login cria uma sessão, então esta é a única porta a fechar.
+      session: {
+        delete: auditHooks.session.delete,
+        create: {
+          before: async (newSession) => {
+            const [owner] = await getDb(env.DB)
+              .select({
+                deletedAt: userTable.deletedAt,
+                email: userTable.email,
+              })
+              .from(userTable)
+              .where(eq(userTable.id, newSession.userId))
+              .limit(1)
+            if (owner?.deletedAt) {
+              throw new APIError('FORBIDDEN', {
+                message: 'Esta conta foi encerrada.',
+                code: 'ACCOUNT_CLOSED',
+              })
+            }
+            // Modo lista: quem saiu da lista não entra mais, nem com conta antiga.
+            if (!owner || !(await canEnter(owner.email))) {
+              throw new APIError('FORBIDDEN', {
+                message: 'Este e-mail não tem acesso.',
+                code: 'ACCESS_DENIED',
+              })
+            }
+            if (
+              !(await registrarEntrada(
+                getDb(env.DB),
+                newSession.userId,
+                owner.email,
+              ))
+            ) {
+              throw new APIError('FORBIDDEN', {
+                message: 'Este e-mail não tem acesso.',
+                code: 'ACCESS_DENIED',
+              })
+            }
+          },
+        },
+      },
+      user: {
+        // `/update-user` aceita o que o navegador mandar: `image` só vale se
+        // for a foto do próprio app e `name` tem limite (src/lib/profile.ts).
+        update: {
+          before: async (data) => ({ data: sanitizeProfileUpdate(data) }),
+        },
+        create: {
+          // Login por código não traz nome: usa a parte local do e-mail.
+          before: async (user) => {
+            // Modo lista: só e-mail da lista cria conta (falha fechada).
+            if (!(await canEnter(user.email))) {
+              throw new APIError('FORBIDDEN', {
+                message: 'Este e-mail não tem acesso.',
+                code: 'ACCESS_DENIED',
+              })
+            }
+            if (user.name?.trim()) return
+            return { data: { ...user, name: user.email.split('@')[0] } }
+          },
+          after: auditHooks.user.create.after,
+        },
+      },
+    },
+    advanced: {
+      // `getSession` busca sessão e usuário num JOIN só (relação em
+      // src/db/auth-schema.ts): com o cache do cookie vencido, são 1 ida ao D1
+      // em vez de 2 em fila.
+      database: { joins: true },
+      ipAddress: { ipAddressHeaders: ['cf-connecting-ip', 'x-forwarded-for'] },
+      // Tarefas "em segundo plano" (enviar o e-mail do código) seguem depois da
+      // resposta, no `waitUntil` do Worker, sem atrasar nem revelar se o e-mail existe.
+      backgroundTasks: { handler: (promise) => waitUntil(promise) },
+      // Cookie `Secure` fora do localhost. Sem URL conhecida, vale o padrão do Better Auth.
+      ...(baseURL ? { useSecureCookies: !isLocalUrl(baseURL) } : {}),
+    },
+    plugins: [
+      emailOTP({
+        otpLength: 6,
+        expiresIn: OTP_EXPIRES_IN_SECONDS,
+        allowedAttempts: 3,
+        // Só o hash do código fica no banco (tabela `verification`), e é um
+        // HMAC com o segredo do app (src/lib/auth-config.ts, `otpHasher`):
+        // o SHA-256 puro do 'hashed' cai por força bruta em 6 dígitos.
+        storeOTP: { hash: otpHasher(env.BETTER_AUTH_SECRET) },
+        // Entrega só `sign-in` e `email-verification` (src/lib/auth-otp.ts).
+        sendVerificationOTP: deliverOtp,
+        overrideDefaultEmailVerification: true,
+      }),
+      // tanstackStartCookies() deve ser SEMPRE o último plugin
+      tanstackStartCookies(),
+    ],
+  })
+}
+
+// Os endpoints HTTP do Better Auth (por exemplo, ver sessão e mudar nome)
+// também recebem o cookie de perfil. Após revogação, atendem como anônimos,
+// conservando os cookies independentes do OAuth para um novo login.
+export async function atenderAutenticacao(env: Env, request: Request) {
+  const auth = getAuth(env, request)
+  const cookie = request.headers.get('cookie')
+  if (cookie) {
+    const { sessionToken, sessionData } = getCookies(auth.options)
+    const partes = cookie.split(';').map((parte) => parte.trim())
+    if (partes.some((parte) => parte.startsWith(`${sessionToken.name}=`))) {
+      const atual = await auth.api.getSession({
+        headers: request.headers,
+        query: { disableRefresh: true },
+      })
+      if (atual && !(await enforceAccess(env, atual))) {
+        const headers = new Headers(request.headers)
+        headers.set(
+          'cookie',
+          partes
+            .filter((parte) => {
+              const nome = parte.split('=', 1)[0]
+              return (
+                nome !== sessionToken.name &&
+                nome !== sessionData.name &&
+                !nome.startsWith(`${sessionData.name}.`)
+              )
+            })
+            .join('; '),
+        )
+        return auth.handler(new Request(request, { headers }))
+      }
+    }
+  }
+  return auth.handler(request)
+}

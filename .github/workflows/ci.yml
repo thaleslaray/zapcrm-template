@@ -1,0 +1,79 @@
+name: CI
+
+# Roda a cada push na main e em todo pull request. Só confere: NÃO publica.
+# O CI nunca publica. (O botão Deploy to Cloudflare é outra coisa: liga o
+# Workers Builds, que publica a cada push na main.)
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Um push novo no mesmo branch cancela a execução anterior, que ficou velha.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Tipos · lint · testes · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # O .dev.vars não é versionado e chave real nunca entra no CI: o build,
+      # o prerender e os testes rodam com um segredo aleatório descartável.
+      - name: .dev.vars de mentira
+        run: |
+          cp .dev.vars.example .dev.vars
+          sed -i "s|^BETTER_AUTH_SECRET=.*|BETTER_AUTH_SECRET=$(openssl rand -hex 32)|" .dev.vars
+
+      # typecheck = cf-typegen (tipos do env a partir do wrangler.jsonc) + tsc
+      - run: npm run typecheck
+      - run: npm run check
+      # Inclui src/rules.test.ts, as regras do AGENTS.md em forma de teste.
+      - run: npm run test
+      # Sobe o servidor de dev de verdade (vite dev + workerd), abandona o
+      # primeiro pedido de algumas páginas e confere que ele continua
+      # respondendo. Trava o defeito do React.lazy no servidor (AGENTS.md).
+      - run: npm run test:cold
+      - run: npm run build
+
+      # Valida o pacote e os bindings sem publicar nada (não precisa de conta).
+      - name: wrangler deploy --dry-run
+        run: npx wrangler deploy --dry-run
+
+      # drizzle/ guarda o snapshot do schema: gerar de novo sem mudança no
+      # schema não escreve nada. Se escreveu, alguém mudou src/db/*.ts e
+      # esqueceu de gerar e versionar a migração.
+      - name: Schema e migrações combinam
+        run: |
+          npm run db:generate
+          if [ -n "$(git status --porcelain drizzle)" ]; then
+            git status --porcelain drizzle
+            echo "::error::O schema mudou sem migração. Rode npm run db:generate e versione a pasta drizzle/."
+            exit 1
+          fi
+
+  # Procura segredo (chave de API, token, senha) em todo o histórico do git.
+  # Action oficial do Gitleaks, fixada por SHA (v3.0.0). Repositório de ORGANIZAÇÃO
+  # precisa do segredo `GITLEAKS_LICENSE` (gratuito, em gitleaks.io); conta
+  # pessoal não precisa.
+  segredos:
+    name: Segredos no histórico (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

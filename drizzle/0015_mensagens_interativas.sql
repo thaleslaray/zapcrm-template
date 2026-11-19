@@ -1,0 +1,1 @@
+ALTER TABLE `mensagens` ADD `interativa` text;

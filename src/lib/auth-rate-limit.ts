@@ -1,0 +1,158 @@
+// Rate limit de todo POST em /api/auth/* (somente servidor).
+// O limitador interno do Better Auth está desligado (src/lib/auth.ts): quem
+// limita é esta função, chamada por src/routes/api/auth/$.ts.
+import { env } from 'cloudflare:workers'
+
+import { acessoPorEmail } from '#/lib/acesso-email'
+import { otpDailyCapReached } from '#/lib/otp-daily-cap'
+import { isRateLimited, tooManyRequests } from '#/lib/rate-limit'
+
+// Fora do limite: sair e ler a sessão não gastam e-mail nem testam senha.
+const UNLIMITED_SUFFIXES = ['/sign-out', '/get-session']
+
+// Endpoints que ENVIAM e-mail ou testam senha: além do IP, limita por e-mail,
+// para que um atacante com muitos IPs não encha a caixa de uma pessoa de
+// códigos. A VERIFICAÇÃO do código (`/sign-in/email-otp`,
+// `/email-otp/verify-email`, `/email-otp/check-verification-otp`) fica só com
+// a chave por IP, de propósito: com a chave por e-mail, quem soubesse o
+// e-mail de alguém esgotava o limite dele e o impedia de entrar. Adivinhar o
+// código não compensa: são 3 tentativas por código emitido (`allowedAttempts`).
+const EMAIL_KEYED_SUFFIXES = [
+  '/email-otp/send-verification-otp',
+  '/sign-in/email',
+  '/sign-up/email',
+  '/forget-password/email-otp',
+  '/email-otp/reset-password',
+]
+
+// Caminhos que mandam e-mail com código (mesmos de EMAIL_SENDING_PATHS em
+// src/lib/auth-otp.ts): contam no teto diário global.
+const DAILY_CAPPED_SUFFIXES = [
+  '/email-otp/send-verification-otp',
+  '/sign-up/email',
+]
+
+// Tipos de código que têm tela e e-mail (src/lib/auth-otp.ts).
+const ALLOWED_OTP_TYPES = ['sign-in', 'email-verification']
+
+function normalizedPath(url: string): string {
+  let path = new URL(url).pathname
+  try {
+    path = decodeURIComponent(path)
+  } catch {
+    // Percent-encoding inválido: vale o caminho como veio.
+  }
+  return path.length > 1 ? path.replace(/\/+$/, '') : path
+}
+
+function endsWithAny(path: string, suffixes: string[]): boolean {
+  return suffixes.some((suffix) => path.endsWith(suffix))
+}
+
+/**
+ * Lê o corpo do POST como objeto, pelo `content-type` (o Better Auth aceita
+ * JSON e `application/x-www-form-urlencoded`; ler só JSON deixava o formulário
+ * urlencoded contornar o limite por e-mail). `null` = corpo que não se
+ * consegue ler: quem chama recusa em vez de pular o limite.
+ */
+async function readBody(
+  request: Request,
+): Promise<Record<string, unknown> | null> {
+  const type = (request.headers.get('content-type') ?? '')
+    .split(';')[0]
+    ?.trim()
+    .toLowerCase()
+  try {
+    if (type === 'application/x-www-form-urlencoded') {
+      const params = new URLSearchParams(await request.clone().text())
+      // Chave repetida: vale a primeira (como o parser do Better Auth).
+      const body: Record<string, unknown> = {}
+      for (const [key, value] of params) if (!(key in body)) body[key] = value
+      return body
+    }
+    if (type === 'application/json' || type === '') {
+      const body: unknown = await request.clone().json()
+      return body && typeof body === 'object' && !Array.isArray(body)
+        ? (body as Record<string, unknown>)
+        : null
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** E-mail do corpo, em minúsculas; `null` se não houver um e-mail plausível. */
+export function emailFromBody(
+  body: Record<string, unknown> | null,
+): string | null {
+  const value = body?.email
+  if (typeof value !== 'string') return null
+  const email = value.trim().toLowerCase()
+  return email.length > 0 && email.length <= 254 && email.includes('@')
+    ? email
+    : null
+}
+
+/**
+ * Devolve uma resposta de recusa (429 ou 400) ou `null` para a requisição seguir.
+ * Chame só para POST.
+ */
+export async function authRateLimit(
+  request: Request,
+): Promise<Response | null> {
+  const path = normalizedPath(request.url)
+  if (endsWithAny(path, UNLIMITED_SUFFIXES)) return null
+
+  if (await isRateLimited('auth', { headers: request.headers })) {
+    return tooManyRequests()
+  }
+
+  if (!endsWithAny(path, EMAIL_KEYED_SUFFIXES)) return null
+  const body = await readBody(request)
+  if (!body) {
+    return Response.json(
+      { message: 'Corpo da requisição inválido.' },
+      { status: 400 },
+    )
+  }
+
+  // O Better Auth envia o código em segundo plano, então um tipo não suportado
+  // só apareceria no log. Recusar aqui devolve o erro a quem chamou.
+  if (
+    path.endsWith('/email-otp/send-verification-otp') &&
+    typeof body.type === 'string' &&
+    !ALLOWED_OTP_TYPES.includes(body.type)
+  ) {
+    return Response.json(
+      { message: 'Tipo de código não suportado.' },
+      { status: 400 },
+    )
+  }
+
+  const email = emailFromBody(body)
+  if (
+    email &&
+    (await isRateLimited('auth-email', {
+      headers: request.headers,
+      key: `auth-email:${email}`,
+    }))
+  ) {
+    return tooManyRequests()
+  }
+
+  // Teto diário global de e-mails de código (src/lib/otp-daily-cap.ts): por
+  // último, para pedido já recusado acima não gastar o teto.
+  // No modo lista, e-mail fora dela não recebe código, então não gasta o teto;
+  // mas o teto é LIDO para ele também (`count: false`), para o 429 de teto
+  // estourado ser igual ao de quem está na lista. No modo 'open' todo mundo conta.
+  if (
+    endsWithAny(path, DAILY_CAPPED_SUFFIXES) &&
+    (await otpDailyCapReached(new Date(), {
+      count: await acessoPorEmail(env, email),
+    }))
+  ) {
+    return tooManyRequests()
+  }
+  return null
+}

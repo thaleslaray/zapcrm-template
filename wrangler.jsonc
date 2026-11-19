@@ -1,0 +1,125 @@
+// Configuração do Worker (Wrangler + Vite plugin v1).
+// Mudou algo aqui? Rode `npm run cf-typegen` para atualizar os tipos em worker-configuration.d.ts.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zapcrm",
+  // Data de compatibilidade do runtime. Mantenha atual.
+  "compatibility_date": "2026-11-07",
+  "compatibility_flags": ["nodejs_compat"],
+  // Entrada própria: o handler do TanStack Start + cron.
+  "main": "src/server.ts",
+  // O caminho dos avisos contém um segredo por número. Só guarde logs da aplicação.
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": false }
+  },
+  // Sobe os source maps no deploy: erros em produção apontam para o código-fonte.
+  "upload_source_maps": true,
+  // Colocação do Worker (docs: developers.cloudflare.com/workers/configuration/placement/).
+  // O template tem banco (D1), então a região vem FIXA, perto dele. O D1 tem UM
+  // primário, numa região só (ENAM, por exemplo). Worker longe dele paga uma
+  // viagem por consulta em fila (130 a 190 ms cada, medido do Rio).
+  // Regra:
+  //   - Com banco (o normal): região fixa perto do D1. Banco e Worker são
+  //     criados juntos, no mesmo lugar (o `/deploy` cria o banco com
+  //     `--location enam` antes do primeiro deploy). Aqui: `aws:us-east-1`.
+  //   - Sem banco: TIRE a região (apague a linha `placement`). Sem nada parado
+  //     num lugar para consultar, o Worker perto do usuário é melhor.
+  //   - Público fora das Américas: mude banco e região juntos. Exemplo, Europa:
+  //     `wrangler d1 create <nome> --location weur` e `aws:eu-west-1`.
+  // A região usa o formato provedor:região (aws, gcp ou azure). As estratégias
+  // `mode`, `region`, `host` e `hostname` se excluem: use uma só.
+  // Medido em 18/11/2026 (Worker de teste, D1 em ENAM, k6 vindo do Brasil,
+  // `cf-placement: remote-IAD` confirmado). p95 em ms, `mode: "smart"` contra
+  // região fixa:
+  //   estático 28 / 22; login 103 / 198; logado 378 / 248; gravação 507 / 278.
+  //   Dentro do Worker, GET /app: 246 ms (smart) contra 19 ms (região).
+  // Só a página pública renderizada no servidor piorou (103 para 198 ms; as
+  // duas dentro da meta de 300). O `smart` não ajudou: ficou em `local-GIG`
+  // (Rio) por 56 min com o banco em ENAM e não moveu.
+  // ANTES de medir, confira `cf-placement` (deve mostrar `remote-<local perto
+  // do banco>`, aqui `remote-IAD`) e espere a colocação ficar ativa: a medição
+  // de 17/11 foi feita antes disso e errou (login 708 ms, logado 741 ms).
+  // O que é pré-renderizado e os arquivos de /assets/ saem sempre do ponto mais
+  // perto do visitante.
+  "placement": { "region": "aws:us-east-1" },
+  // Arquivos estáticos (o plugin do Vite preenche a pasta sozinho).
+  // Páginas pré-renderizadas saem como `/termos/index.html`; sem barra final na URL.
+  "assets": {
+    "html_handling": "drop-trailing-slash"
+  },
+  // Banco D1, acessado via Drizzle (src/db). Sem `database_id` de propósito: o
+  // `/deploy` cria o banco com `--location` (perto da região do `placement`)
+  // antes do primeiro deploy e grava o `database_id` aqui. Quem usar o botão
+  // Deploy ou o `wrangler deploy` direto, sem `database_id`, recebe o banco
+  // onde a Cloudflare escolher (perto de quem rodou). Confira com
+  // `npx wrangler d1 info <nome>` se ficou perto da região. O local não muda
+  // depois de criado. No dev, o banco é local e se cria sozinho.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "zapcrm-db",
+
+      "migrations_dir": "drizzle"
+    }
+  ],
+  // Armazenamento de arquivos (R2). Sem `bucket_name`: o bucket também é criado
+  // no primeiro deploy, com o nome do Worker como prefixo.
+  "r2_buckets": [
+    {
+      "binding": "BUCKET"
+    }
+  ],
+  // O histórico v1 é imutável. A v2 aposenta o contador de demonstração.
+  "durable_objects": {
+    "bindings": [{ "name": "TEMPO_REAL", "class_name": "TempoRealSetor" }]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Counter"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["Counter"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["TempoRealSetor"]
+    }
+  ],
+  // Rate limit por IP nos endpoints públicos de escrita (login): 5 por minuto.
+  // `namespace_id` é um inteiro (como texto) único na conta; `period` só aceita 10 ou 60.
+  // Os dois limites do ZapCRM usam namespaces próprios na conta.
+  // Uso: src/lib/rate-limit.ts (falha aberta se o binding não existir).
+  "ratelimits": [
+    {
+      "name": "PUBLIC_RATE_LIMIT",
+      "namespace_id": "31841",
+      "simple": { "limit": 5, "period": 60 }
+    },
+    // Rate limit por USUÁRIO nas server functions de quem está logado: 60 por
+    // minuto, chave `user:<id>:leitura` ou `user:<id>:escrita` (cada um conta
+    // à parte). Sem ele, uma conta logada esgota a cota diária do D1 do plano
+    // gratuito. Mesmo aviso do namespace_id acima: número próprio do produto.
+    // Uso: `limitarUsuario()` de src/lib/rate-limit.ts (falha aberta sem o binding).
+    {
+      "name": "USER_RATE_LIMIT",
+      "namespace_id": "31842",
+      "simple": { "limit": 60, "period": 60 }
+    }
+  ],
+  // Cron (UTC): chama o scheduled() de src/server.ts todo dia às 03:00.
+  "triggers": {
+    "crons": ["0 3 * * *", "5 3 * * *"]
+  },
+  // Sem bloco "vars" de propósito. A URL pública do app (BETTER_AUTH_URL) é
+  // deduzida da requisição. Quer fixar uma URL? Crie a variável BETTER_AUTH_URL
+  // no `.dev.vars` (dev) ou como segredo (produção). Segredos NÃO entram aqui.
+  // Endereço público: domínio próprio. Com ele, o workers.dev e as URLs de
+  // preview ficam desligados, para o app ter uma porta de entrada só.
+  // Cloudflare Email Service (plano Workers Paid, domínio verificado em
+  // Compute → Email Service → Email Sending). Com EMAIL_FROM definido como
+  // segredo, src/lib/email.ts usa este binding quando RESEND_API_KEY não existe.
+  "send_email": [{ "name": "EMAIL" }]
+}

@@ -1,0 +1,55 @@
+# Segredos LOCAIS. Copie para .dev.vars (não versionado): cp .dev.vars.example .dev.vars
+# Defina BETTER_AUTH_SECRET e os e-mails liberados em ACCESS_ALLOWLIST. As outras chaves podem ficar vazias (vazio = desligado).
+# A URL do app NÃO precisa ser definida: com BETTER_AUTH_URL vazio, o app usa a URL da requisição.
+# Em produção, os mesmos nomes vão num .prod.vars e sobem com `npx wrangler secret bulk .prod.vars`.
+# Esta lista também gera os tipos do Env (`npm run cf-typegen`): chave nova entra aqui.
+
+# Assina os cookies de sessão. Gere com: openssl rand -base64 32
+# Mínimo de 32 caracteres: vazio ou curto faz o app recusar o login.
+BETTER_AUTH_SECRET=
+
+# URL do app (opcional). Deixe vazio: o app usa a URL da requisição. Preencha só para fixar
+# (ex.: http://localhost:3001, ou https://app.seudominio.com.br em produção). Em localhost o
+# e-mail sem provedor vai para o terminal; fora dele, sem provedor o envio falha de propósito.
+BETTER_AUTH_URL=
+
+# Login com senha (opcional). Vazio = desligado (só código por e-mail e login social).
+# `true` ou `1` liga: quem cria conta com senha confirma o e-mail por código antes de entrar.
+PASSWORD_LOGIN_ENABLED=
+
+# Lista de acesso (só vale com `accessMode: 'allowlist'` em src/config/app.ts; o ZapCRM usa este modo).
+# E-mails que podem receber código e criar conta, separados por vírgula (ex.: ana@exemplo.com,bia@exemplo.com).
+# Maiúsculas e espaços não importam. Vazio = NINGUÉM entra (falha fechada). Em produção é segredo do
+# Worker (`wrangler secret put ACCESS_ALLOWLIST` ou no .prod.vars), nunca vai no wrangler.jsonc.
+ACCESS_ALLOWLIST=
+
+# Teto diário GLOBAL de e-mails com código de login/cadastro (opcional). Vazio = 500 por dia (UTC).
+# `0` desliga. Ajuste à cota do seu provedor (Resend gratuito: 100 por dia).
+OTP_DAILY_LIMIT=
+
+# E-mail (opcional). Sem estas duas variáveis, o e-mail aparece no terminal do `npm run dev`.
+# Crie a chave em https://resend.com/api-keys
+RESEND_API_KEY=
+# Remetente, ex.: ZapCRM <suporte@zapcrm.example>. Precisa ser de domínio verificado no provedor.
+# Vazio com Resend: usa onboarding@resend.dev (só entrega para o e-mail da sua conta Resend).
+EMAIL_FROM=
+
+# Login social (opcional). Cada provedor só liga com o par (id + segredo) preenchido.
+# Redirect URI a cadastrar no provedor: <BETTER_AUTH_URL>/api/auth/callback/google
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+# Redirect URI a cadastrar no provedor: <BETTER_AUTH_URL>/api/auth/callback/github
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+
+# Registro de desempenho (opcional). `1` liga: o Worker escreve UMA linha JSON por pedido em console.log
+# (caminho, status, tempo, onde rodou, e cada ida ao D1 com a fila). Vazio = desligado, sem custo.
+# Em produção só durante a medição: `wrangler tail` mostra as linhas; desligue depois. Veja AGENTS.md.
+PERF_LOG=
+
+# Par opcional de compatibilidade. Usado somente sem servidor uazapi cadastrado no D1.
+# Para os testes de navegador, use o endereço e o token do servidor falso local.
+UAZAPI_URL=
+UAZAPI_ADMIN_TOKEN=
+# Chave de 32 bytes em base64 para cifrar os tokens dos números e o administrativo. Gere com openssl rand -base64 32.
+UAZAPI_CHAVE=

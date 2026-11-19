@@ -1,0 +1,56 @@
+import { collect, type MdxModule } from './mdx'
+
+// Validação do frontmatter sem biblioteca: o zod inteiro (uns 60 KB) entrava
+// no JavaScript principal porque o `loader` das rotas de conteúdo mora nele.
+// Cada função confere um campo e devolve o valor; erro vira `throw`, e o
+// `collect` (mdx.ts) o transforma em "Frontmatter inválido em <arquivo>".
+// O build (prerender) importa estes módulos: frontmatter errado quebra o
+// build, não o visitante.
+type Fields = Record<string, unknown>
+
+function texto(f: Fields, campo: string): string {
+  const v = f[campo]
+  if (typeof v !== 'string') throw new Error(`"${campo}" precisa ser texto`)
+  return v
+}
+
+function data(f: Fields, campo: string): string {
+  const v = texto(f, campo)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    throw new Error(`"${campo}": use AAAA-MM-DD`)
+  }
+  return v
+}
+
+function campos(raw: unknown): Fields {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('frontmatter precisa ser um objeto')
+  }
+  return raw as Fields
+}
+
+const legalSchema = (raw: unknown) => {
+  const f = campos(raw)
+  return { title: texto(f, 'title'), updated: data(f, 'updated') }
+}
+
+export const legal = collect(
+  import.meta.glob('/content/legal/*.mdx', {
+    query: '?meta',
+    import: 'default',
+    eager: true,
+  }),
+  import.meta.glob<MdxModule>('/content/legal/*.mdx'),
+  legalSchema,
+)
+
+/** "2026-11-05" -> "5 de novembro de 2026" (sem depender do fuso do servidor). */
+export function formatDate(iso: string): string {
+  const [y, m, d] = iso.split('-').map(Number)
+  return new Intl.DateTimeFormat('pt-BR', {
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(new Date(Date.UTC(y, m - 1, d)))
+}

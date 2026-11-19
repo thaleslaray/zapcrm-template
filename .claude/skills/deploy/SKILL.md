@@ -1,0 +1,262 @@
+---
+name: deploy
+description: Publica o app na Cloudflare Workers com o Wrangler — login, deixa o Wrangler criar o D1 e o R2 no primeiro deploy, aplica as migrações remotas, sobe os segredos e faz o deploy. Use quando o app estiver pronto para ir ao ar ou para publicar uma versão nova.
+---
+
+# Publicar na Cloudflare Workers
+
+O agente roda cada comando e edita cada arquivo; o usuário faz o login no
+navegador, informa os valores de produção e diz "pode publicar" antes de cada
+passo que mexe na conta: o `wrangler deploy`, as migrações `--remote`, os
+segredos e o teste de carga. Mostre o comando e espere o sim. A configuração vive em `wrangler.jsonc` e o deploy é com o
+Wrangler. Não use o `cf` aqui (ele está em beta; veja o `AGENTS.md`).
+
+## 0. Antes de começar
+
+```bash
+npx wrangler login     # abre o navegador; o usuário aprova
+npx wrangler whoami    # confere a conta
+```
+
+Confirme o domínio público e o e-mail de suporte da instalação; substitua os valores reservados em `src/config/app.ts`. O nome configurado é `zapcrm`
+em `wrangler.jsonc` e `package.json`.
+Sem domínio próprio, o app sai em `<nome>.<conta>.workers.dev`.
+
+**Mais de uma conta na Cloudflare?** O Wrangler pergunta qual usar a cada
+comando (e trava num terminal sem pergunta). Pegue o id no `npx wrangler whoami`
+e fixe com `CLOUDFLARE_ACCOUNT_ID=<id>` na frente de CADA comando do Wrangler
+(`deploy`, `secret put`, `d1`, `tail`, `npm run deploy` e `db:migrate:remote`).
+
+## 1. Banco e bucket
+
+O ZapCRM usa D1, por isso o `wrangler.jsonc` fixa a região do Worker
+(`"placement": { "region": "aws:us-east-1" }`, perto do D1 em ENAM). **Banco e
+Worker são criados juntos, no mesmo lugar.** O local do D1 só se escolhe na
+criação e não muda depois (doc: developers.cloudflare.com/d1/configuration/data-location/).
+A criação automática do primeiro deploy (sem `database_id`) põe o banco perto de
+quem rodou o comando e não aceita local. Por isso, ANTES do primeiro deploy, com
+o sim do usuário:
+
+1. Se o `d1_databases` do `wrangler.jsonc` já tem `database_id`, pule este passo.
+2. Senão, crie o banco com o local que casa com a região escolhida:
+
+```bash
+npx wrangler d1 create <database_name do wrangler.jsonc> --location enam
+# copie o database_id que ele imprime para o d1_databases do wrangler.jsonc
+```
+
+O R2 continua sem `bucket_name`: o Wrangler cria o bucket no primeiro deploy.
+
+Locais aceitos: `wnam`, `enam`, `weur`, `eeur`, `apac`, `oc`. Não existe local
+para América do Sul, África nem Oriente Médio (o D1 não roda lá): para o
+Brasil, `enam`. O local é uma dica ("o mais perto possível"), não garantia.
+Dado que precisa ficar na UE, nos EUA ou em data center FedRAMP:
+`--jurisdiction=eu` (ou `us`, `fedramp`), que vale mais que a dica.
+
+**Público fora das Américas:** banco e região mudam juntos. Europa, por
+exemplo: `--location weur` e `aws:eu-west-1` no `placement`.
+**Produto sem banco:** tire a região fixa do `wrangler.jsonc` (apague a linha
+`placement`): sem nada parado num lugar, o Worker perto do usuário é melhor.
+
+Botão Deploy ou `wrangler deploy` direto sem `database_id`: o banco nasce onde a
+Cloudflare escolher. Confira com `npx wrangler d1 info <database_name>` se ficou
+perto da região.
+
+Troque `url` em `src/config/app.ts` pela URL pública ANTES do build
+(sitemap, canonical, og:url).
+
+## 2. URL pública
+
+Em produção, `BETTER_AUTH_URL` é OBRIGATÓRIO como segredo (a URL pública
+final, ex.: `https://app.seudominio.com.br`). A ordem depende do endereço:
+
+- **Domínio próprio já conhecido:** a URL vai no `.prod.vars` ANTES do
+  primeiro deploy.
+- **Sem domínio próprio:** o endereço `<nome>.<conta>.workers.dev` só aparece
+  no FIM do primeiro deploy. Publique e, logo em seguida, grave a URL com
+  `npx wrangler secret put BETTER_AUTH_URL` (com o `CLOUDFLARE_ACCOUNT_ID` se
+  houver mais de uma conta), ANTES de qualquer teste ou login.
+
+Motivo: sem ele a URL é deduzida da requisição e cada host que chega
+ao Worker vira origem confiável do login; além disso, `workers.dev` e o
+domínio próprio têm cookies separados e o OAuth (callback cadastrado no
+provedor) só funciona em um deles. Com a variável, o app confia só nessa
+origem. No localhost continua opcional.
+
+## 3. Segredos de produção (crie ANTES do primeiro deploy)
+
+Crie um arquivo `.prod.vars` (já está no `.gitignore`; nunca o versione)
+com os mesmos nomes do `.dev.vars.example`:
+
+```
+BETTER_AUTH_SECRET=<novo, gerado com openssl rand -base64 32>
+BETTER_AUTH_URL=<obrigatório em produção: https://app.seudominio.com.br>
+RESEND_API_KEY=<OBRIGATÓRIO (ou o binding EMAIL + EMAIL_FROM): sem provedor de e-mail o login não funciona>
+EMAIL_FROM=ZapCRM <suporte@dominio-da-instalacao>
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+PASSWORD_LOGIN_ENABLED=   # opcional; true liga o login com senha
+ACCESS_ALLOWLIST=         # só com accessMode 'allowlist' em src/config/app.ts: e-mails que entram, separados por vírgula
+```
+
+**Cadastro só para e-mails liberados.** Se `accessMode` em `src/config/app.ts`
+for `'allowlist'`, grave a lista como segredo (vazia = ninguém entra, nem você),
+com o sim do usuário: `npx wrangler secret put ACCESS_ALLOWLIST` (cole os
+e-mails separados por vírgula; ou a linha no `.prod.vars`). Nunca no
+`wrangler.jsonc`. Mudar a lista é gravar o segredo de novo; quem sai dela perde
+a sessão no próximo pedido. Para o teste de carga (passo 7), as contas de
+carga (`load-1@exemplo.test` em diante, uma por `CONTAS`) entram na lista antes
+de rodar e saem depois.
+
+Nunca reaproveite o segredo do dev (mínimo de 32 caracteres).
+
+**Provedor de e-mail é obrigatório antes de publicar.** Configure o Resend (ou o
+Email Service da Cloudflare, veja `src/lib/email.ts`). Sem provedor, fora do
+localhost, o pedido de código de login responde 503 `EMAIL_NAO_CONFIGURADO` e a
+tela mostra "O envio de e-mail deste sistema ainda não foi configurado. Avise
+quem administra." (antes, a tela dizia "código enviado" e o erro ficava só no
+log). Um provedor social (Google/GitHub) não substitui: o login por código
+continua na tela. Não publique para uso real sem isto.
+
+## 4. Primeiro deploy
+
+Os segredos do passo 3 já têm de estar no `.prod.vars` (sem domínio próprio,
+a `BETTER_AUTH_URL` ainda não existe: grave-a logo depois, veja o passo 2).
+Confira na conta que os `namespace_id` do ZapCRM (`31841` e `31842`) estão reservados para os limites público e por usuário. Produtos na mesma conta com o mesmo identificador compartilham a cota.
+
+Depois:
+
+```bash
+npm run build
+npx wrangler deploy --dry-run
+npx wrangler deploy --secrets-file .prod.vars   # cria banco e bucket e publica
+npm run db:migrate:remote                       # só depois do primeiro deploy
+```
+
+## 5. Deploys seguintes
+
+```bash
+npm run deploy    # predeploy migra o banco remoto, depois build + publica
+```
+
+Confira:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://<domínio>/termos    # 200
+curl -s -o /dev/null -w "%{http_code}\n" https://<domínio>/app       # 307 → /login
+```
+
+## 6. Depois do deploy
+
+1. Login social: adicione `https://<domínio>/api/auth/callback/google` (e
+   `/github`) nos apps OAuth (veja `/google-oauth`).
+2. `src/config/app.ts`: confirme que `url` é a URL pública (links em e-mails e SEO).
+3. Resend: verifique o domínio de envio e ajuste `EMAIL_FROM`.
+4. Domínio próprio: Cloudflare → Workers → o Worker → Domains & Routes. Com
+   domínio próprio, recomende desligar `workers_dev` e `preview_urls` (campos
+   do `wrangler.jsonc`): senão o app continua acessível também em
+   `*.workers.dev` e nas URLs de preview, com cookies separados e uma
+   segunda porta de entrada para o mesmo app. Só documentação: o ZapCRM
+   NÃO traz esses campos no `wrangler.jsonc`. Quando o usuário tiver o
+   domínio no ar e disser sim, o ajuste é:
+
+   ```jsonc
+   "workers_dev": false,
+   "preview_urls": false
+   ```
+
+   (confira os nomes em `node_modules/wrangler/config-schema.json` antes de
+   escrever, e rode `npx wrangler deploy --dry-run`).
+5. Réplica de leitura do D1 (deixa as páginas logadas mais rápidas longe do
+   banco; sem custo extra). O código já usa a Sessions API; falta ligar no banco,
+   uma vez por app. Pelo painel: D1 → o banco → Settings → Enable Read
+   Replication (limite: as réplicas ficam em ENAM, WNAM, WEUR, EEUR, APAC e OC;
+   não há na América do Sul). Ou pela API (o Wrangler não tem comando para isso), com um token
+   que tenha `D1:Edit`. Peça para o usuário rodar `export CLOUDFLARE_API_TOKEN=...`
+   no terminal dele; não cole o token no chat.
+
+   ```bash
+   npx wrangler d1 info <nome-do-banco>   # mostra o id e "read_replication.mode"
+   curl -X PUT "https://api.cloudflare.com/client/v4/accounts/<account_id>/d1/database/<database_id>" \
+     -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" \
+     -d '{"read_replication": {"mode": "auto"}}'
+   ```
+
+   Confira com `npx wrangler d1 info <nome-do-banco>`: `read_replication.mode`
+   deve aparecer `auto`.
+6. **Onde o Worker roda** (a conferência que mais pesa na velocidade; faça logo
+   depois do deploy). O D1 tem um primário numa região só; se o Worker roda
+   longe dele, cada consulta em fila atravessa o continente. O ZapCRM tem
+   banco e vem com a região fixa perto dele (`placement.region: aws:us-east-1`,
+   D1 em ENAM). Com `mode: smart` (colocação automática) o Worker só se move se
+   já rodou perto do banco; com público só no Brasil ele ficou no Rio
+   (`local-GIG`) por 56 min com o banco em ENAM e cada ida ao D1 custa 130 a 190 ms.
+   Medido em 18/11/2026 (D1 em ENAM, cliente no Brasil, `cf-placement:
+   remote-IAD` confirmado), p95 de região fixa contra automática: estático
+   22 / 28 ms, login 198 / 103, logado 248 / 378, gravação 278 / 507. Dentro do
+   Worker, GET /app: 19 ms contra 246 ms. Só a página pública renderizada no
+   servidor piorou (103 para 198 ms), as duas dentro da meta de 300 ms. Não há
+   região do D1 na América do Sul.
+   **Antes de medir, confira `cf-placement` (deve mostrar `remote-<local perto
+   do banco>`, aqui `remote-IAD`) e espere a colocação ficar ativa.** A medição de 17/11 foi feita
+   antes disso (o cabeçalho não apareceu) e deu login 708 ms e logado 741 ms,
+   números errados.
+   Confira, nesta ordem:
+
+   a. O cabeçalho de resposta (`remote-XXX` = o Worker foi movido; `local-XXX` =
+      rodou perto de quem pediu; XXX é o código de aeroporto do data center):
+
+      ```bash
+      curl -sI https://<domínio>/login | grep -i cf-placement
+      ```
+
+   b. Onde o Worker rodou e de onde o D1 respondeu, de verdade. Com o sim do
+      usuário, ligue o registro de desempenho só para esta conferência, pegue uns
+      pedidos logados e desligue:
+
+      ```bash
+      npx wrangler secret put PERF_LOG        # digite 1
+      npx wrangler tail --format json         # em outro terminal: abra /app e /app/conversas logado
+      npx wrangler secret delete PERF_LOG     # ao terminar (o registro gera uma linha por pedido)
+      ```
+
+      Em cada linha `{"perf":1,...}` compare `colo` (onde o Worker rodou) com
+      `d1_regioes` / `d1[].r` (de onde o D1 respondeu, ex.: `ENAM`) e olhe `fila`
+      (idas em fila) e `ms`. Worker no Rio (`GIG`) e D1 em `ENAM` = cada ida paga
+      a viagem; com `fila` 2 ou mais, a página sente.
+   c. Longe do banco e `ms` alto? Primeiro confira se banco e região estão no
+      mesmo lugar: `npx wrangler d1 info <database_name>` (onde o banco ficou) e
+      `cf-placement` (onde o Worker rodou). Se não casam, a região do
+      `wrangler.jsonc` está errada para o banco que existe (o banco não muda;
+      troque a região, formato `provedor:região`, como `aws:us-east-1`,
+      `gcp:us-east4` ou `azure:eastus`; lista em
+      developers.cloudflare.com/workers/configuration/placement/). As estratégias
+      `mode`, `region`, `host` e `hostname` se excluem: troque a linha, não some.
+      Rode `npm run test` (confere o formato), publique e repita a, b e a medição
+      do passo 7, **olhando também o p95 das páginas públicas e logadas**.
+      Produto sem banco: tire a região (apague a linha `placement`).
+      Pré-renderizadas e `/assets/` saem do ponto mais perto do visitante.
+   d. Réplica de leitura ligada (item 5)? Em `d1[].p`, `false` = uma réplica
+      respondeu. Lembrete: não há réplica na América do Sul (ENAM, WNAM, WEUR,
+      EEUR, APAC, OC), então para público só do Brasil a réplica não aproxima o
+      dado.
+
+## 7. Conferir o produto
+
+Abra a raiz sem sessão e entre com um e-mail liberado. Confira o destino Conversas, as abas Funil, Contatos e Retornos, a página Conta e o acesso às Configurações por papel. Registre a URL, o resultado do login e a revisão publicada. Antes de disponibilizar uma instalação real, confirme o domínio de suporte, o remetente e que os dados fictícios saíram das telas.
+
+A spec do protótipo dispensa carga. Se uma medição for solicitada separadamente, configure as rotas e a escrita real em `load/rotas.json`, obtenha autorização para a conta e confira o resultado de cada operação. As leituras da base são Conversas e Contatos. A primeira escrita operacional entra com o cadastro de contato.
+
+Botão Deploy to Cloudflare (Workers Builds): publica a cada push na `main`.
+Build command `npm run build`; deploy command
+`npx wrangler deploy && npx wrangler d1 migrations apply DB --remote` (a migração
+vai depois porque o banco só existe depois do primeiro deploy).
+
+## Lembretes
+
+- Dependências com `^` e `package-lock.json` versionado; quem clona recebe o lock.
+- A saída do build fica em `dist/` (`dist/server/wrangler.json` é a config
+  que o Wrangler publica, gerada pelo plugin a partir do `wrangler.jsonc`).
+- Logs ao vivo: `npx wrangler tail` (com `CLOUDFLARE_ACCOUNT_ID` se houver mais de uma conta). No macOS não existe `timeout`: para parar, Ctrl+C, ou rode em segundo plano e encerre o processo.

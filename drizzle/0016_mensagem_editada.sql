@@ -1,0 +1,1 @@
+ALTER TABLE `mensagens` ADD `editada` integer DEFAULT false NOT NULL;
