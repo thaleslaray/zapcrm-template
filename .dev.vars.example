@@ -1,7 +1,7 @@
 # Segredos LOCAIS. Copie para .dev.vars (não versionado): cp .dev.vars.example .dev.vars
 # Defina BETTER_AUTH_SECRET e os e-mails liberados em ACCESS_ALLOWLIST. As outras chaves podem ficar vazias (vazio = desligado).
 # A URL do app NÃO precisa ser definida: com BETTER_AUTH_URL vazio, o app usa a URL da requisição.
-# Em produção, os mesmos nomes vão num .prod.vars e sobem com `npx wrangler secret bulk .prod.vars`.
+# Em produção, os mesmos nomes vão num .prod.vars e sobem no primeiro deploy com `npx wrangler deploy --secrets-file .prod.vars` (depois, `npx wrangler secret bulk .prod.vars` atualiza).
 # Esta lista também gera os tipos do Env (`npm run cf-typegen`): chave nova entra aqui.
 
 # Assina os cookies de sessão. Gere com: openssl rand -base64 32
@@ -23,7 +23,7 @@ PASSWORD_LOGIN_ENABLED=
 # Worker (`wrangler secret put ACCESS_ALLOWLIST` ou no .prod.vars), nunca vai no wrangler.jsonc.
 ACCESS_ALLOWLIST=
 
-# Teto diário GLOBAL de e-mails com código de login/cadastro (opcional). Vazio = 500 por dia (UTC).
+# Teto diário GLOBAL de e-mails com código de login/cadastro (opcional). Vazio = 100 por dia (UTC).
 # `0` desliga. Ajuste à cota do seu provedor (Resend gratuito: 100 por dia).
 OTP_DAILY_LIMIT=
 

@@ -57,9 +57,31 @@ Em **Configurações**, a gestão cadastra o servidor uazapi (endereço e token 
 
 Grupos ficam de fora: o ZapCRM trata só conversas individuais.
 
+## Antes de publicar: o envio de e-mail
+
+O login do ZapCRM não usa senha: a pessoa digita o e-mail e recebe um código de 6 dígitos. No seu computador (`npm run dev`), o código aparece no terminal. No sistema publicado isso é desligado de propósito, então **sem um serviço de envio de e-mail ninguém entra, nem você**.
+
+Se você publicar sem isso, a tela de entrada mostra "O envio de e-mail deste sistema ainda não foi configurado" e nenhum código é criado. O sistema fica no ar, com a porta fechada.
+
+### Caminho mais simples: Resend, sem domínio
+
+1. Crie uma conta gratuita em [resend.com](https://resend.com) e gere uma chave em **API Keys**.
+2. No `.prod.vars`, preencha `RESEND_API_KEY` com a chave e deixe `EMAIL_FROM` vazio.
+
+Com `EMAIL_FROM` vazio, o sistema envia como `onboarding@resend.dev`. Segundo o Resend, esse remetente de teste só entrega para o e-mail da sua própria conta Resend. Basta para você entrar e conhecer o sistema; não serve para a sua equipe. Use na conta Resend o mesmo e-mail que está no `ACCESS_ALLOWLIST`.
+
+Este caminho está no código (`src/lib/email.ts`), mas **não foi testado por nós com envio real**.
+
+### Para a equipe entrar: domínio próprio
+
+- **Resend com domínio verificado:** verifique o domínio no Resend, mantenha `RESEND_API_KEY` e preencha `EMAIL_FROM`, por exemplo `ZapCRM <suporte@seudominio.com.br>`.
+- **Cloudflare Email Service:** com um domínio seu na Cloudflare, deixe `RESEND_API_KEY` vazio e preencha só `EMAIL_FROM`. O `wrangler.jsonc` já traz a ligação `send_email`. Confira na Cloudflare os requisitos de plano desse serviço.
+
+Se `RESEND_API_KEY` estiver preenchida, o Resend é sempre usado. O sistema envia no máximo 100 códigos por dia; `OTP_DAILY_LIMIT` muda esse teto.
+
 ## Publicar na Cloudflare
 
-O sistema roda em um Cloudflare Worker, com banco D1 e arquivos no R2. O `wrangler.jsonc` vem sem identificação de banco e sem domínio: no primeiro `wrangler deploy`, a Cloudflare cria o banco e o armazenamento na **sua** conta.
+O sistema roda em um Cloudflare Worker, com banco D1 e arquivos no R2. O `wrangler.jsonc` vem sem identificação de banco e sem domínio: no primeiro `wrangler deploy`, a Cloudflare cria o banco e o armazenamento na **sua** conta. Isso foi testado numa conta nova: do `npm ci` ao sistema no ar leva poucos minutos. Se você tem mais de uma conta na Cloudflare, fixe a conta em cada comando com `CLOUDFLARE_ACCOUNT_ID=<id da conta>`.
 
 O passo a passo completo, com login, migrações e segredos, está em `.claude/skills/deploy/SKILL.md`. Com o Claude Code aberto na pasta, basta pedir "publica o sistema".
 
