@@ -99,7 +99,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.6",
-    "@cloudflare/vite-plugin": "^1.67.0",
+    "@cloudflare/vite-plugin": "^1.70.1",
     "@mdx-js/rollup": "^3.1.1",
     "@playwright/test": "^1.65.1",
     "@tailwindcss/typography": "^0.5.16",
